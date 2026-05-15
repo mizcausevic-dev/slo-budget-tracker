@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
+from . import audit_stream
 from .models import (
     BurnRateAlert,
     BurnRateSample,
@@ -29,11 +31,14 @@ from .models import (
 )
 from .storage import InMemoryStore, ObservationStore
 
+if TYPE_CHECKING:
+    import httpx
+
 
 class SLOTracker:
     """An SLO + its observation history. Thread-safe via the underlying store."""
 
-    __slots__ = ("_clock", "_definition", "_store")
+    __slots__ = ("_clock", "_definition", "_previous_alerted_windows", "_store")
 
     def __init__(
         self,
@@ -45,6 +50,10 @@ class SLOTracker:
         self._definition = definition
         self._store: ObservationStore = store or InMemoryStore(max_age_seconds=definition.window_seconds)
         self._clock = clock
+        # Tracks which short windows were alerting on the previous
+        # `check_burn_rate_with_audit` call. Used to detect started vs
+        # recovered transitions so we only fire one event per state change.
+        self._previous_alerted_windows: set[int] = set()
 
     @property
     def definition(self) -> SLODefinition:
@@ -123,6 +132,68 @@ class SLOTracker:
                         sample_count=sample.sample_count,
                     )
                 )
+        return alerts
+
+    async def check_burn_rate_with_audit(
+        self,
+        http_client: httpx.AsyncClient,
+        *,
+        at: float | None = None,
+    ) -> list[BurnRateAlert]:
+        """Check burn rates **and** emit transition events to the audit-stream spine.
+
+        This is a thin wrapper over :meth:`check_burn_rate` that tracks
+        which windows were alerting on the previous call and emits one
+        event per transition:
+
+        - ``slo_burn_started`` — window newly crossed the threshold
+        - ``slo_recovered``    — window cleared since the previous call
+
+        Stateless polling (calling :meth:`check_burn_rate` directly)
+        ignores transitions and just returns the current alerts. Use
+        this method when you want governance events to land in
+        ``audit-stream-py`` automatically.
+
+        The emit is best-effort: a failed POST is logged and swallowed,
+        never raised. The tracker's transition bookkeeping advances
+        regardless of emit outcome so consumers don't get stuck
+        re-firing the same event.
+        """
+        alerts = self.check_burn_rate(at=at)
+        current_alerted = {a.window_seconds for a in alerts}
+        newly_started = current_alerted - self._previous_alerted_windows
+        recovered = self._previous_alerted_windows - current_alerted
+
+        # Advance state BEFORE emit so a slow audit-stream doesn't make
+        # us re-fire the same transition on the next call.
+        self._previous_alerted_windows = current_alerted
+
+        for alert in alerts:
+            if alert.window_seconds in newly_started:
+                await audit_stream.emit(
+                    http_client,
+                    kind="slo_burn_started",
+                    payload={
+                        "slo_name": alert.slo_name,
+                        "window_seconds": alert.window_seconds,
+                        "burn_rate": alert.burn_rate,
+                        "threshold": alert.threshold,
+                        "success_ratio": alert.success_ratio,
+                        "sample_count": alert.sample_count,
+                    },
+                )
+
+        for window in recovered:
+            await audit_stream.emit(
+                http_client,
+                kind="slo_recovered",
+                payload={
+                    "slo_name": self._definition.name,
+                    "window_seconds": window,
+                    "threshold": self._definition.burn_rate_threshold,
+                },
+            )
+
         return alerts
 
     # ---- internals ------------------------------------------------------

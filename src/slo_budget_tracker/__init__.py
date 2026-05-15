@@ -21,7 +21,7 @@ from .prometheus import PrometheusExporter
 from .registry import SLORegistry
 from .tracker import SLOTracker
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "BurnRateAlert",
